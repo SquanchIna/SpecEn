@@ -26,6 +26,8 @@ import matplotlib.colors as mcolors
 import seaborn as sns
 import matplotlib.gridspec as gridspec
 import matplotlib.dates as mdates
+import json
+from pathlib import Path
 
 
 dask.config.set({"array.slicing.split_large_chunks": True})
@@ -33,66 +35,162 @@ dask.config.set({"array.slicing.split_large_chunks": True})
 
 
 class SPECS():
-    
-    def __init__( self,
-                  min_lat,
-                  max_lat,
-                  min_lon,
-                  max_lon,
-                  CentTime,
-                  anzT,
-                  varname
-                ):
-        self.min_lat = min_lat
-        self.min_lon = min_lon
-        self.max_lat = max_lat
-        self.max_lon = max_lon
-        self.CentTime = CentTime
-        self.anzT    = anzT
-        self.varname = varname
-    
+
+    def _load_config(self, config_file):
+        """
+        Opens json file and loads configuration parameters
+        as class attributes
+        """
+        with open(config_file) as f:
+            config = json.load(f)#, object_hook=self._decode_datetime)
+
+        self.outdir = config["outputdir"]
+        self.files =  config["files"]
+        self.varname = config["varname"]
+        self.cent_lon = float(config["cent_lon"])
+        self.cent_lat = float(config["cent_lat"])
+        self.cent_time = datetime64(config["CentTime"])
+        self.anz_lon = int(config["anzLon"])
+        self.anz_lat = int(config["anzLat"])
+        self.anz_time = int(config["anzT"])
+
+        log_file =  self.outdir +  "/Data/logger.log"
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format="%(asctime)s - %(levelname)s: %(message)s",
+        )
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
+        )
+        logFormatter = logging.Formatter(
+            "%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s]  %(message)s"
+        )
+        rootLogger = logging.getLogger()
+        fileHandler = logging.FileHandler(log_file)
+        fileHandler.setFormatter(logFormatter)
+        rootLogger.addHandler(fileHandler)
+        consoleHandler = logging.StreamHandler()
+        consoleHandler.setFormatter(logFormatter)
+        rootLogger.addHandler(consoleHandler)
+
+    def show_config(self):
+        """
+        Prints the configuration parameters
+        """
+        attributes = vars(self)
+        # print("Configuration:")
+        logging.info("Configuration:")
+        for attr, value in attributes.items():
+            # print(f"{attr}: {value}")
+            logging.info(f"{attr}: {value}")
+
     def prepare_dataset(self,inputdir):
-        data = xr.open_mfdataset(inputdir+"*.nc",engine="netcdf4")
+
+        if Path(inputdir).suffix != ".nc":
+            data = xr.open_mfdataset(inputdir + "*.nc", engine="netcdf4")
+        else:
+            data = xr.open_dataset(inputdir, engine="netcdf4")
+
         self.mapproj = self._check_map_proj(data)
         data = data[self.varname]
         data = self._calculate_mm(data)
         data = data.chunk("auto")
         # Find index of Center coordinates         
-        
-        mask_lon = (data.lon >= self.min_lon) & (data.lon <= self.max_lon)
-        mask_lat = (data.lat >= self.min_lat) & (data.lat <= self.max_lat)
-        mask = mask_lon & mask_lat
-        data = data.where(mask.compute(), drop=True)
-        
-        inds = data.sel(time = self.CentTime, method = 'nearest')
-        #index_of_CentLat = np.where(data.lat.values == inds.lat.values)[0][0] 
-        #index_of_CentLon = np.where(data.lon.values == inds.lon.values)[0][0] 
-        index_of_CentTime = np.where(data.time.values == inds.time.values)[0][0] 
-        # 1) Cut file around center coordinates 
-        data = data.isel(time = slice(index_of_CentTime-self.anzT, index_of_CentTime+self.anzT))
-        
-        print(data.sizes)
-        # 2) Smooth data at outmost 10% of gridpoints
-        if 'lon' in data.sizes: 
-            self.coordX = 'lon'
-            self.coordY = 'lat'
-        elif 'x' in data.sizes: 
-            self.coordX = 'x'
-            self.coordY = 'y'
-        else:
+
+        if self.anz_lon % 2 != 0:
+            raise ValueError(f"anzLon muss gerade sein, erhalten: {self.anz_lat}")
+
+        if self.anz_lat % 2 != 0:
+            raise ValueError(f"anzLat muss gerade sein, erhalten: {self.anz_lat}")
+
+        if self.anz_time % 2 != 0:
+            raise ValueError(f"anzLat muss gerade sein, erhalten: {self.anz_time}")
+
+        # calculate total number of gridpoints
+        nx_total = 2 ** int(np.ceil(np.log2(self.anz_lon)))
+        ny_total = 2 ** int(np.ceil(np.log2(self.anz_lat)))
+        nt_total = 2 ** int(np.ceil(np.log2(self.anz_time)))
+
+        self.N_x = (nx_total - self.anz_lon) // 2
+        self.N_y = (ny_total - self.anz_lat) // 2
+        self.N_t = (nt_total - self.anz_time) // 2
+
+        # Define coordinates in Wavelet space
+        n_spat = int(np.log2(nx_total))
+        n_temp = int(np.log2(nt_total))
+        self.S = 2 ** np.arange(0, n_spat)
+        self.T = 2 ** np.arange(0, n_temp)
+
+        # Check whether central coordinates are within the dataset range
+        if not data.lon.min() < self.cent_lon < data.lon.max():
             raise ValueError(
-                f'coordinates not implementet yet.'
-            ) from None
-        
-        nt, nx, ny = [int((data.sizes['time']/100)*20),int((data.sizes[self.coordX]/100) *20),int((data.sizes[self.coordY]/100)*20)]
-        t = np.append(np.linspace(0, 1, nt),np.append(np.ones(data.time.shape[0]-2*nt),np.linspace(1, 0, nt)))
-        y = np.append(np.linspace(0, 1, ny),np.append(np.ones(data[self.coordY].shape[0]-2*ny),np.linspace(1, 0, ny)))
-        x = np.append(np.linspace(0, 1, nx),np.append(np.ones(data[self.coordX].shape[0]-2*nx),np.linspace(1, 0, nx)))    
+                f"cent_lon = {self.cent_lon} is outside the dataset range. "
+                f"Please choose a value between {data.lon.min().compute().item()} "
+                f"and {data.lon.max().compute().item()}."
+            )
+
+        if not data.lat.min() < self.cent_lat < data.lat.max():
+            raise ValueError(
+                f"cent_lat = {self.cent_lat} is outside the dataset range. "
+                f"Please choose a value between {data.lat.min().compute().item()} "
+                f"and {data.lat.max().compute().item()}."
+            )
+
+        if not data.time.min() <= self.cent_time <= data.time.max():
+            raise ValueError(
+                f"cent_time = {self.cent_time} is outside the dataset range. "
+                f"Please choose a value between {data.time.min().values} "
+                f"and {data.time.max().values}."
+            )
+
+        # find Index of cent_lon, cent_lat
+        dist = (data.lon - self.cent_lon) ** 2 + (data.lat - self.cent_lat) ** 2
+        idx_y, idx_x = np.unravel_index( dist.argmin().compute().item(), dist.shape)
+        idx_time =np.abs(data.time - self.cent_time).argmin().compute().item()
+
+        # Ausschnitt definieren
+        if "lon" in data.dims and "lat" in data.dims:
+            self.x_dim, self.y_dim = "lon", "lat"
+        elif "x" in data.dims and "y" in data.dims:
+            self.x_dim, self.y_dim = "x", "y"
+        else:
+            raise ValueError("Could not identify spatial dimensions (lon/lat or x/y).")
+
+        #logging.info( f"Dims of dataset identified: {self.x_dim}, {self.y_dim} " )
+
+        # Select data subset
+        data = data.isel(
+            {
+                self.x_dim: slice(idx_x   - self.anz_lon  // 2, idx_x  + self.anz_lon  // 2),
+                self.y_dim: slice(idx_y   - self.anz_lat  // 2, idx_y  + self.anz_lat  // 2),
+                "time": slice(idx_time - self.anz_time // 2, idx_time + self.anz_time // 2)
+            }
+        )
+
+        nt = max(1, int(data.sizes["time"] * 0.2))
+        nx = max(1, int(data.sizes[self.x_dim] * 0.2))
+        ny = max(1, int(data.sizes[self.y_dim] * 0.2))
+
+        ## smooth edges
+        t = np.append(np.linspace(0, 1, nt),np.append(np.ones(data.time.shape[0]       -2*nt),np.linspace(1, 0, nt)))
+        y = np.append(np.linspace(0, 1, ny),np.append(np.ones(data[self.y_dim].shape[0]-2*ny),np.linspace(1, 0, ny)))
+        x = np.append(np.linspace(0, 1, nx),np.append(np.ones(data[self.x_dim].shape[0]-2*nx),np.linspace(1, 0, nx)))
         # Create a 3D grid of linear gradients
-        weight_matrix = np.outer(t, np.ones((x.shape[0],y.shape[0])))
-        weight_matrix = weight_matrix.reshape((t.shape[0],x.shape[0], y.shape[0]))
-        # Apply the linear gradients along y and x dimensions
-        weight_matrix *= np.outer(x, y)
+
+        weight_matrix = np.einsum("i,j,k->ijk", t, x, y)
+        weights = xr.DataArray(
+            weight_matrix,
+            dims=("time", self.x_dim, self.y_dim),
+            coords={
+                "time": data.time,
+                self.x_dim: data[self.x_dim],
+                self.y_dim: data[self.y_dim]
+            }
+        )
+
         dat = data*weight_matrix
         
         return dat
@@ -122,41 +220,16 @@ class SPECS():
         # 3) Pad with zero at the edges 
         ### define numer of values to be added
         # Get updated dimensions after possible trimming
-        x_len, y_len, time_len = data.sizes[self.coordX], data.sizes[self.coordY], data.sizes['time']
-        # Make sure x and y dimensions are equal by trimming the larger one
-        if x_len > y_len:
-            padY = int((x_len - y_len)/2) 
-            padX = 0    
-        elif y_len > x_len:
-            padX = int((y_len - x_len)/2) 
-            padY = 0  
-        
-        pad_kwargs = {self.coordX: padX, self.coordY: padY}
+        x_len, y_len, time_len = data.sizes[self.x_dim], data.sizes[self.y_dim], data.sizes['time']
+
+        pad_kwargs = {self.x_dim: self.N_x, self.y_dim: self.N_y, 'time': self.N_t}
         data = data.pad(**pad_kwargs, constant_values=0)
-        print(data.sizes)
-        pad_test = (2**np.arange(0,12) - data.sizes[self.coordY] *2)
-        ind     = next((i for i, num in enumerate(pad_test) if num > 0), -1)
-        self.pad_lat = int((2**np.arange(0,12)[ind]-data.sizes[self.coordY])/2)
-        
-        pad_test = (2**np.arange(0,12) - data.sizes[self.coordX] *2)
-        ind     = next((i for i, num in enumerate(pad_test) if num > 0), -1)
-        self.pad_lon = int((2**np.arange(0,12)[ind]-data.sizes[self.coordX])/2)
-        
-        pad_test = (2**np.arange(0,12) - data.sizes['time'] *2)
-        ind     = next((i for i, num in enumerate(pad_test) if num > 0), -1)
-        self.pad_time = int((2**np.arange(0,12)[ind]-data.sizes['time'])/2)
-        
-        pad_kwargs = {self.coordX: self.pad_lon, self.coordY: self.pad_lat, "time": self.pad_time}
-        dat = data.pad(**pad_kwargs, constant_values=0)
-        dat = dat.fillna(0)
-        
-        self.pad_lat = self.pad_lat + padY
-        self.pad_lon = self.pad_lon + padX
-        print(dat.sizes)
-        return dat
+        data = data.fillna(0)
+
+        return data
     
     def decompose_1D(self,var):     
-        gp_spat = var.sizes[self.coordX]
+        gp_spat = var.sizes[self.x_dim]
         gp_temp = var.sizes['time']
         n_spat = int(np.log2(gp_spat)) 
         n_temp = int(np.log2(gp_temp)) 
@@ -176,7 +249,7 @@ class SPECS():
         return scales
     
     def decompose_2D(self,var):     
-        gp_spat = var.sizes[self.coordX]
+        gp_spat = var.sizes[self.x_dim]
         gp_temp = var.sizes['time']
         n_spat = int(np.log2(gp_spat)) 
         n_temp = int(np.log2(gp_temp)) 
@@ -196,7 +269,7 @@ class SPECS():
     
     def decompose_3D(self,var):
         
-        gp_spat = var.sizes[self.coordX]
+        gp_spat = var.sizes[self.x_dim]
         gp_temp = var.sizes['time']
         n_spat = int(np.log2(gp_spat)) 
         n_temp = int(np.log2(gp_temp)) 
@@ -209,7 +282,7 @@ class SPECS():
         test = trans.forward(X, nlevels=n_temp)
         
         scales_RE = [test.highpasses[scale].real.reshape(2**(n_temp-scale-1),gp_spat,gp_spat) for scale in (range(0,n_temp))]
-        scales_IM = [test.highpasses[scale].real.reshape(2**(n_temp-scale-1),gp_spat,gp_spat) for scale in (range(0,n_temp))]
+        scales_IM = [test.highpasses[scale].imag.reshape(2**(n_temp-scale-1),gp_spat,gp_spat) for scale in (range(0,n_temp))]
         
         # Initialize DTCWT transform object
         trans = dtcwt.Transform2d()
@@ -236,11 +309,11 @@ class SPECS():
         return(res)
     
 
-    def saveFile(self,data, data_pad, decomp1,decomp2,decomp3,S,T,out):
-        print(decomp1.shape)
-        decomp1 = decomp1[:,self.pad_lat:(decomp1.shape[1]-self.pad_lat),self.pad_lon:(decomp1.shape[2]-self.pad_lon)]
-        decomp2 = decomp2[:, self.pad_time:(decomp2.shape[1]-self.pad_time)]
-        print(decomp1.shape)
+    def saveFile(self,data, decomp1,decomp2,decomp3):
+        #print(decomp1.shape)
+        decomp1 = decomp1[:,self.N_y:(decomp1.shape[1]-self.N_y),self.N_x:(decomp1.shape[2]-self.N_x)]
+        decomp2 = decomp2[:, self.N_t:(decomp2.shape[1]-self.N_t)]
+        #print(decomp1.shape)
         output = xr.Dataset(
             data_vars = dict(
                 WT_T= (["resT", "y","x"], decomp1),
@@ -249,30 +322,30 @@ class SPECS():
                 Data= (["time", "y","x"], data.values),
             ),
             coords = dict(
-                x = ("x", data[self.coordX].values),
-                y = ("y", data[self.coordY].values),
+                x = ("x", data[self.x_dim].values),
+                y = ("y", data[self.y_dim].values),
                 time = ("time", data['time'].values),
-                resT = ("resT", T),
-                resS = ("resS", S),
+                resT = ("resT", self.T),
+                resS = ("resS", self.S),
             )
         )
-        output.to_netcdf(path=out + "/SpecEns.nc")
+        output.to_netcdf(path=  self.outdir + "/Data/specEns.nc")
         
         return(output)
 
     
-    def plotEvent(self,data,out):
+    def plotEvent(self,data):
         fig = plt.figure(figsize=(10, 5))
         data.Data.sum(dim='time').plot(subplot_kws=dict(projection=self.mapproj), cmap= 'magma_r',cbar_kwargs={'label': "[mm]"})
         plt.title('Precipitation sum: '+ np.datetime_as_string(data.time.values[0], unit='h') + ' - ' + np.datetime_as_string(data.time.values[-1], unit='h') )
         ax = plt.gca()
         ax.add_feature(cp.feature.BORDERS, linestyle='-', alpha=1)
         ax.gridlines(draw_labels=False, y_inline=False)
-        plt.savefig(out +"/Niederschlagsmenge.png",bbox_inches='tight')
+        plt.savefig(self.outdir + "/Data/PrecipitationSum.png",bbox_inches='tight')
         plt.close()
     
     
-    def plotDec1(self,data,out):
+    def plotDec1(self,data):
         n_temp = data.sizes['resT']
         WT_T_norm = data.WT_T.values
         WT_T_norm = WT_T_norm/(np.sum(WT_T_norm,axis=0)+0.0000001)                   ## Normalise (still needed?)
@@ -303,11 +376,11 @@ class SPECS():
         ax1.gridlines(draw_labels=False, y_inline=False)
         # Add markers for Munich, Augsburg, and Regensburg
         ax1.set_title('Dominant temporal scale')
-        plt.savefig(out +"/Dominant_temp_scale.png",bbox_inches='tight')
+        plt.savefig(self.outdir + "/Data/Dominant_temp_scale.png",bbox_inches='tight')
         plt.close()
     
 
-    def plotDec2(self,data,out):
+    def plotDec2(self,data):
         n_spat = data.sizes['resS']
         squared_data = data.Data ** 2
         ##define colors for the filled areas
@@ -343,11 +416,11 @@ class SPECS():
         cbar.set_label('Spatial Scale')
         cbar.set_ticklabels(2 ** np.arange(0, n_spat))
         
-        plt.savefig(out +"/spat_scale.png",bbox_inches='tight')
+        plt.savefig(self.outdir + "/Data/spat_scale.png",bbox_inches='tight')
         plt.close()
     
     
-    def plotDec3(self,data,out):
+    def plotDec3(self,data):
         n_spat = data.sizes['resS']
         n_temp = data.sizes['resT']
         
@@ -367,12 +440,12 @@ class SPECS():
         ax3.set_ylim(0,n_temp)
         ax3.set_xlim(0,n_spat)
         
-        plt.savefig(out +"/spat_temp_scale.png",bbox_inches='tight')
+        plt.savefig(self.outdir + "/Data/spat_temp_scale.png",bbox_inches='tight')
         plt.close()
     
         
     def _check_map_proj(self, output):
-        if output.attrs['model_id'] == 'radklim':
+        if "RADKLIM" in output.attrs["title"]:
             projection = ccrs.Stereographic(true_scale_latitude=0.0, central_latitude=51.0, central_longitude= 9.0)
         else:
             projection = ccrs.PlateCarree()
